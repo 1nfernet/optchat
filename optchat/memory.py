@@ -7,6 +7,9 @@ from .storage import Store
 from .util import PLACEHOLDER, VIEW, flat, size
 
 
+ZOOM_CHARS = 12_000  # Characters of one message that zoom returns. read_message gives the rest.
+
+
 @dataclass(frozen=True)
 class Part:
     l: int
@@ -163,14 +166,17 @@ class Memory:
         if n & (n - 1) or id % n or id + n > self.total:
             return missing
         if n == 1:
-            return f"{id}+0|{self.store.root[id].source}"
+            source = self.store.root[id].source
+            if len(source) <= ZOOM_CHARS:
+                return f"{id}+0|{source}"
+            return f"{id}+0|{source[:ZOOM_CHARS]}\n[The message has {len(source)} characters. read_message({id}, {ZOOM_CHARS}) gives the rest.]"
         level = n.bit_length() - 2
         children = [Part(level, id // (n // 2) + j) for j in (0, 1)]
         if not all(self.built(p) for p in children):
             return missing
         return "\n".join(f"{p.start}+{p.n}|{flat(self.text(p))}" for p in children)
 
-    def search(self, query: str, limit: int = 20):
+    def search(self, query: str, limit: int = 10):
         """Original messages that contain the most words of the query: the words of
         the user first, then replies, then the rest; newer before older."""
         import re

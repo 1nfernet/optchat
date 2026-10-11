@@ -48,6 +48,27 @@ class QuietMemory(unittest.TestCase):
         self.assertEqual(nxt["arrived_later"], 5)
         self.assertNotIn((0, 3), self.service.store.tree, "later messages wait for the next run")
 
+    def test_codex_gets_only_the_memory_tools_and_short_descriptions(self):
+        import json
+        from optchat.mcp import MEMORY_TOOLS, TOOLS, dispatch
+        names = [t["name"] for t in dispatch({"method": "tools/list"}, None, MEMORY_TOOLS)["tools"]]
+        self.assertEqual(names, ["append", "view", "search", "zoom", "date", "read_message"])
+        with self.assertRaises(ValueError):
+            dispatch({"method": "tools/call", "params": {"name": "compact_next", "arguments": {}}}, None, MEMORY_TOOLS)
+        seen = lambda tools: len(json.dumps([{k: t[k] for k in ("name", "description", "inputSchema")} for t in tools]))
+        self.assertLess(seen(MEMORY_TOOLS), 2500, "the tool text that a model reads")
+        self.assertLess(seen(TOOLS), 4500)
+
+    def test_append_reply_holds_no_hint_to_summarize(self):
+        self.note(STATUS_AT * 2)
+        reply = self.service.call("append", {"event_id": "last", "kind": "user", "text": "hello"})
+        self.assertEqual(set(reply), {"id", "gid", "status", "ordered"})
+
+    def test_search_returns_ten_lines_by_default(self):
+        for k in range(15):
+            self.service.call("append", {"event_id": f"d{k}", "kind": "user", "text": f"flavor {k}"})
+        self.assertEqual(len(self.service.call("search", {"query": "flavor"})["text"].splitlines()), 11)
+
     def test_search_finds_and_limits(self):
         for k, text in enumerate(["use tabs in flutter", "the default flavor is internal", "unrelated"] + [f"flavor note {k}" for k in range(30)]):
             self.service.call("append", {"event_id": f"s{k}", "kind": "user", "text": text})

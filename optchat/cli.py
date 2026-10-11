@@ -13,7 +13,8 @@ def parser():
     p = argparse.ArgumentParser(description="OptChat: one memory for Claude Code and Codex agents, served over MCP. It never runs a model.")
     p.add_argument("--chat", type=Path, default=DEFAULT_CHAT)
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("mcp", help="Serve MCP over stdio, and start the memory service if it is not running")
+    mcp = sub.add_parser("mcp", help="Serve MCP over stdio, and start the memory service if it is not running")
+    mcp.add_argument("--memory-only", action="store_true", help="Offer only the memory tools, without the summary tools")
     srv = sub.add_parser("serve", help="Run the memory service in the foreground")
     srv.add_argument("--wait", action="store_true", help="If another copy holds the lock, wait for it and take over when it stops")
     sub.add_parser("status")
@@ -65,7 +66,8 @@ def main():
             return
         client = Client(args.chat, autostart=args.command != "stop")
         if args.command == "mcp":
-            serve_stdio(client); return
+            from .mcp import MEMORY_TOOLS, TOOLS
+            serve_stdio(client, MEMORY_TOOLS if args.memory_only else TOOLS); return
         if args.command == "hook":
             event = json.load(sys.stdin)
             from .hooks import enqueue

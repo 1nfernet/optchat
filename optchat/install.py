@@ -129,6 +129,16 @@ def registered(cli, name="optchat"):
     return exe is not None and subprocess.run([exe, "mcp", "get", name], capture_output=True).returncode == 0
 
 
+def codex_args(name="optchat"):
+    """The arguments with which Codex starts the server, or None."""
+    exe = shutil.which("codex")
+    found = exe and subprocess.run([exe, "mcp", "get", name, "--json"], capture_output=True, text=True)
+    try:
+        return json.loads(found.stdout)["transport"]["args"] if found and found.returncode == 0 else None
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def install(args):
     plan = Plan(args.apply)
     chat = Path(args.chat or DEFAULT_CHAT).expanduser()
@@ -164,11 +174,15 @@ def install(args):
         plan.run(["systemctl", "--user", "enable", "optchat.service"], "start at boot")
         plan.run(["systemctl", "--user", "restart", "optchat.service"], "start now with the current code")
 
-    # MCP for Claude Code and Codex.
+    # MCP for Claude Code and Codex. Codex gets only the memory tools: it never summarizes,
+    # and it loads every tool description into each session.
     for cli, argv in (("claude", ["claude", "mcp", "add", "--scope", "user", "optchat", "--", RUN, "mcp"]),
-                      ("codex", ["codex", "mcp", "add", "optchat", "--", RUN, "mcp"])):
+                      ("codex", ["codex", "mcp", "add", "optchat", "--", RUN, "mcp", "--memory-only"])):
         if not shutil.which(cli):
             print(f"  skip {cli}: not installed")
+        elif cli == "codex" and registered(cli) and codex_args() != argv[-2:]:
+            plan.run(["codex", "mcp", "remove", "optchat"], "remove the old Codex registration")
+            plan.run(argv, "offer only the memory tools in every Codex session")
         elif registered(cli):
             print(f"  ok  {cli} MCP server 'optchat' already registered")
         else:

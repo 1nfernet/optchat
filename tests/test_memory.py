@@ -147,7 +147,9 @@ class ViewTests(Fixture, unittest.TestCase):
         self.assertNotIn("SECRET", m.render())
         with self.assertRaises(RuntimeError):
             m.render(strict=True)
-        self.assertIn("SECRET" * 100000, m.zoom(0, 1))
+        self.assertIn("SECRET" * 1000, m.zoom(0, 1))
+        self.assertIn("read_message(0, 12000) gives the rest", m.zoom(0, 1))
+        self.assertLess(len(m.zoom(0, 1)), 12_200, "zoom keeps a long message out of the context")
 
     def test_no_split_when_budget_increases(self):
         self.make_complete(32)

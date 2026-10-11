@@ -95,12 +95,11 @@ class Service:
             gid = self.ledger.append(args["event_id"], args["kind"], text, args.get("date"), origin)
             self.replica.seal()
             # id: local position (usable with zoom) once ordered; gid: same on every machine.
-            return {"id": self.replica.positions.get(gid), "gid": gid, "status": "saved", "ordered": gid in self.replica.sealed,
-                    "compaction_needed": self.board.compaction_needed()}
+            return {"id": self.replica.positions.get(gid), "gid": gid, "status": "saved", "ordered": gid in self.replica.sealed}
         if method == "view":
             return self.view(args.get("snapshot"), args.get("offset", 0))
         if method == "search":
-            return {"text": self.memory.search(args["query"], args.get("limit", 20))}
+            return {"text": self.memory.search(args["query"], args.get("limit", 10))}
         if method == "status_line":
             waiting = len(self.board.backlog())
             return {"text": f"OptChat: {waiting} to summarize" if waiting >= STATUS_AT else ""}

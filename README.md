@@ -1,6 +1,6 @@
 # OptChat
 
-OptChat keeps one memory for the Claude Code and Codex agents of one user, on all of the user's machines. Each message of a session is stored word for word. This includes the tool calls of the agent and their results.
+OptChat keeps one memory for the Claude Code and Codex agents of one user, on all of the user's machines. Your prompts and the final replies of the agents are stored word for word. The tool calls of one turn are kept as one short record, without their output.
 
 The messages are folded into a binary tree of one-line summaries. The view, about 128 KB, covers the whole history: recent messages have one line each, and older lines cover more messages. When a line is too vague, an agent opens it into the two lines from which it was made, down to the original message. An agent uses the memory only when its task needs it, and starts with a search by words.
 
@@ -49,7 +49,7 @@ The first command prints every change. The second command makes the changes:
 
 - It writes `~/.config/optchat/config.json`.
 - It starts the service at login, with launchd on macOS or a systemd user unit on Linux.
-- It registers the `optchat` MCP server for Claude Code and Codex.
+- It registers the `optchat` MCP server for Claude Code and Codex. Codex gets only the memory tools, because it never summarizes and loads every tool description into each session.
 - It adds the recording hooks, the `optchat-compactor` subagent, the `/optchat-compact` command and a status line to Claude Code. An existing status line stays.
 - It appends a short OptChat section to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`.
 
@@ -59,9 +59,9 @@ Without a config file, OptChat keeps a memory for one machine only.
 
 ## MCP tools
 
-- `search(query, limit)`: find earlier messages by words. It returns up to 20 short lines with ids, so an agent does not need the whole view.
+- `search(query, limit)`: find earlier messages by words. It returns up to 10 short lines with ids by default, so an agent does not need the whole view.
 - `view`: read the current view in pages. Follow `next_offset` with the same `snapshot`.
-- `zoom(id, n)`: open line `id+n` into its two halves. With `n` set to 1 it returns the original message.
+- `zoom(id, n)`: open line `id+n` into its two halves. With `n` set to 1 it returns the original message, up to 12,000 characters. `read_message` gives the rest.
 - `read_message(id, offset)`: read a long original message in pages.
 - `date(id)`: the time of message `id`.
 - `append(event_id, kind, text, origin)`: record a message. The kinds are `user`, `talk`, `tool`, `echo` and `note`.

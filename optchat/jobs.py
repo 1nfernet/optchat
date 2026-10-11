@@ -247,15 +247,6 @@ class JobBoard:
         root, tree = self.memory.store.root, self.memory.store.tree
         return [m for m in root[self.frontier:] if (0, m.i) not in tree and size(m.compact_source) > NODE]
 
-    def worker_active(self, idle=600):
-        """True while a job is leased, or a worker made a call in the last `idle` seconds."""
-        now = self.clock()
-        return bool(self.leases) or any(not w.closed and now - w.touched < idle for w in self.workers.values())
-
-    def compaction_needed(self):
-        """True when enough work waits to show it in the status line."""
-        return len(self.backlog()) >= STATUS_AT
-
     def long_source(self, p):
         return self.state.get(self.state_key(p), {}).get("progress") is not None or len(self.source(p)) > SOURCE_CHUNK
 
