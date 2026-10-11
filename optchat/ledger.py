@@ -11,6 +11,8 @@ import json
 from .util import json_text, now, valid_unicode
 from .storage import normalize_origin
 
+REPORT_WAIT = 7 * 86400  # Seconds to wait for the report of a background subagent.
+
 
 class Ledger:
     def __init__(self, store, replica):
@@ -23,6 +25,7 @@ class Ledger:
         self.db.execute("CREATE TABLE IF NOT EXISTS sessions (key TEXT PRIMARY KEY, role TEXT)")
         # Tool calls of a turn that has not ended yet; Stop turns them into one record.
         self.db.execute("CREATE TABLE IF NOT EXISTS turn (key TEXT PRIMARY KEY, session TEXT, at REAL, origin TEXT, item TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS reports (tool TEXT PRIMARY KEY, session TEXT, at REAL, label TEXT)")
         if "gid" not in {r[1] for r in self.db.execute("PRAGMA table_info(events)")}:
             raise RuntimeError("delivery.sqlite3 is older than replication. Move it away before you start the service.")
         self.db.commit()
@@ -91,6 +94,16 @@ class Ledger:
 
     def stale_turns(self, before):
         return [s for (s,) in self.db.execute("SELECT session FROM turn GROUP BY session HAVING MAX(at) < ?", (before,))]
+
+    def expect_report(self, tool, session, label, at):
+        """Wait for the report of a background subagent. A report that never came is forgotten after REPORT_WAIT."""
+        self.db.execute("DELETE FROM reports WHERE at < ?", (at - REPORT_WAIT,))
+        self.db.execute("INSERT OR REPLACE INTO reports VALUES (?,?,?,?)", (tool, session, at, label))
+        self.db.commit()
+
+    def report_label(self, tool):
+        row = self.db.execute("SELECT label FROM reports WHERE tool=?", (tool,)).fetchone()
+        return row[0] if row else None
 
     def close(self):
         self.db.close()

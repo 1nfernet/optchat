@@ -4,7 +4,8 @@ The memory keeps what changed and what failed. Exploration (file reads,
 searches, read-only commands, web lookups) is kept only as counts and a few
 names: its content is still on disk or on the web. The answers of the user to
 agent questions, subagent reports and approved plans are kept in full,
-because they hold decisions and findings.
+because they hold decisions and findings. Prompts are sorted too: notices of
+the app and of background tasks are not words of the user.
 """
 from __future__ import annotations
 
@@ -17,6 +18,8 @@ from .util import cut_bytes
 
 DIGEST_LIMIT = 420  # Bytes of one turn record. With its origin prefix it stays under 512 bytes, so it is its own summary line and needs no worker.
 REPORT_LIMIT = 4_000  # Characters of a subagent report or a plan.
+NOTICES = ("<ci-monitor-event>",)  # Notices of the desktop app. They hold no words of the user.
+WRAPPERS = re.compile(r"<(system-reminder|artifact-view-context)\b[^>]*>.*?</\1>", re.S)  # Context that the app adds to a prompt.
 IGNORED_TOOLS = {"TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput", "TaskStop", "ToolSearch",
                  "ScheduleWakeup", "Monitor", "ReadNotifications", "ListAgents"}
 READ_ONLY = {"ls", "cat", "head", "tail", "grep", "rg", "ag", "ack", "find", "fd", "wc", "pwd", "echo", "printf", "which",
@@ -127,6 +130,50 @@ def result_text(response):
     return json.dumps(response, ensure_ascii=False) if response is not None else ""
 
 
+def launched(response):
+    """The reply to the start of a background subagent. It holds the prompt, and the report comes later."""
+    if isinstance(response, dict):
+        return response.get("status") == "async_launched" or response.get("isAsync") is True
+    return isinstance(response, str) and response.startswith("Async agent launched")
+
+
+def inner(text, tag):
+    found = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", text, re.S)
+    return found.group(1).strip() if found else ""
+
+
+def prompt(text):
+    """Sort a prompt that Claude Code submits. Next to the words of the user, it
+    submits notices of the app and of background tasks, and messages from other
+    sessions. Returns None for a notice, {"report": tool_use_id, "text": result}
+    for the end of a background task, or {"message": (kind, text)}."""
+    text = WRAPPERS.sub("", text if isinstance(text, str) else "").strip()
+    if not text or text.startswith(NOTICES):
+        return None
+    if text.startswith("<task-notification>"):
+        tool, result = inner(text, "tool-use-id"), inner(text, "result")
+        return {"report": tool, "text": result} if tool and result else None
+    if text.startswith("<cross-session-message"):
+        sender = re.match(r'<cross-session-message\b[^>]*?\bfrom-name="([^"]*)"', text)
+        body = inner(text, "cross-session-message")
+        name = sender.group(1) if sender else "another session"
+        return {"message": ("echo", f"Message from the session {name}:\n" + clip(body, REPORT_LIMIT))} if body else None
+    if text.startswith("<bash-input>"):
+        command = inner(text, "bash-input")
+        return {"message": ("user", "The user ran in the terminal: " + clip(command, 400))} if command else None
+    return {"message": ("user", text)}
+
+
+def stored_kind(kind, text):
+    """The kind of a record, with the mistakes of older versions corrected: None
+    for a notice stored as words of the user or for the start receipt of a
+    background subagent, and "echo" for a subagent report stored as a prompt."""
+    if kind == "user":
+        item = prompt(text)
+        return None if item is None else "echo" if "report" in item else item["message"][0]
+    return None if kind == "echo" and '"status": "async_launched"' in text[:400] else kind
+
+
 def compact(event, root=None):
     """One finished tool call as a small item for the turn record.
 
@@ -152,10 +199,11 @@ def compact(event, root=None):
             return {"message": ("user", "Answers to agent questions:\n" + body)}
         return None
     if tool in ("Agent", "Task"):
+        label = f"{data.get('subagent_type') or 'general'} subagent ({clip(data.get('description') or '', 80)})"
+        if launched(response):
+            return {"report_later": label}
         report = clip(result_text(response), REPORT_LIMIT)
-        who = data.get("subagent_type") or "general"
-        about = clip(data.get("description") or "", 80)
-        return {"message": ("echo", f"Report of the {who} subagent ({about}):\n{report}")} if report else None
+        return {"message": ("echo", f"Report of the {label}:\n{report}")} if report else None
     if tool == "ExitPlanMode":
         plan = data.get("plan")
         return {"message": ("talk", "Plan:\n" + clip(plan, REPORT_LIMIT))} if plan else None

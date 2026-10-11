@@ -21,6 +21,18 @@ def ignored(event):
     return None
 
 
+def text_key(event):
+    """A stable id for a prompt or a final reply. Claude Code gives one prompt id to
+    every prompt that arrives while a turn runs, and a blocking Stop hook can give
+    different replies for one turn. The hash of the text keeps them apart."""
+    if event.get("hook_event_name") == "Stop":
+        base, text = event.get("turn_id") or event.get("prompt_id"), event.get("last_assistant_message")
+    else:
+        base, text = event.get("prompt_id") or event.get("user_message_id"), event.get("prompt")
+    text = valid_unicode(text) if isinstance(text, str) else ""
+    return f"{base}:{hashlib.sha256(text.encode()).hexdigest()}" if base else None
+
+
 def enqueue(chat, event):
     """Write the event to disk before delivery. The next service call delivers any event that is still on disk."""
     if ignored(event):
@@ -28,13 +40,8 @@ def enqueue(chat, event):
     fields = {"hook_event_name", "session_id", "cwd", "agent_type", "agent_id", "event_id", "prompt_id", "user_message_id", "turn_id", "prompt", "tool_name", "tool_input", "tool_use_id", "tool_response", "error", "last_assistant_message"}
     event = {key: value for key, value in event.items() if key in fields}
     if not event.get("event_id"):
-        if event.get("hook_event_name") == "Stop":
-            # A blocking Stop hook can produce different replies for one turn.
-            base = event.get("turn_id") or event.get("prompt_id")
-            text = valid_unicode(event.get("last_assistant_message", ""))
-            event["event_id"] = str(base) + ":" + hashlib.sha256(text.encode()).hexdigest() if base else str(uuid4())
-        else:
-            event["event_id"] = event.get("prompt_id") or event.get("user_message_id") or str(uuid4())
+        key = text_key(event) if event.get("hook_event_name") in ("Stop", "UserPromptSubmit") else None
+        event["event_id"] = key or event.get("prompt_id") or event.get("user_message_id") or str(uuid4())
     directory = chat / "spool"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     sync_dir(chat)
@@ -96,13 +103,25 @@ def ingest(service, event):
     def append(kind, text, identity):
         return service.call("append", {"event_id": keybase + str(identity), "kind": kind, "text": text, "origin": origin})
     if name == "UserPromptSubmit":
-        text = event.get("prompt", "")
-        # Newer clients send a prompt or message id. Without it the caller must
-        # supply event_id, so two identical user messages stay separate.
-        identity = event.get("event_id") or event.get("prompt_id") or event.get("user_message_id")
+        identity = event.get("event_id") or text_key(event)
         if not identity:
             raise ValueError("UserPromptSubmit needs an event_id. The hook client supplies one.")
-        result = append("user", text, identity)
+        item = activity.prompt(event.get("prompt", ""))
+        if item is None:
+            return {"ignored": "a notice of the app or of a background task"}
+        if "report" in item:
+            # The end of a background subagent. Its launch was recorded as a wait
+            # for this report. Background commands and the compactor were not.
+            # A resumed subagent sends a new report with the same tool id.
+            tool = item["report"]
+            label = service.ledger.report_label(tool)
+            if not label:
+                return {"ignored": "a background task without a report to keep"}
+            report = activity.clip(item["text"], activity.REPORT_LIMIT)
+            append("echo", f"Report of the {label}:\n{report}", f"report:{tool}:" + hashlib.sha256(report.encode()).hexdigest()[:16])
+            return {}
+        kind, text = item["message"]
+        result = append(kind, text, identity)
     elif name == "PreToolUse":
         return {"ignored": "A tool call is recorded once, after it finishes."}
     elif name in ("PostToolUse", "PostToolUseFailure"):
@@ -112,6 +131,10 @@ def ingest(service, event):
         item = activity.compact(event, origin.get("project"))
         if item is None:
             return {"ignored": "tool call without lasting value"}
+        if "report_later" in item:
+            # A background subagent. Its report arrives later as a task notification.
+            service.ledger.expect_report(identity, session, item["report_later"], time.time())
+            return {}
         if "message" not in item:
             # Held until the turn ends; Stop turns all calls of the turn into one record.
             service.ledger.hold(keybase + identity, session, origin, item, time.time())
@@ -123,7 +146,7 @@ def ingest(service, event):
         text = event.get("last_assistant_message")
         if not isinstance(text, str) or not text:
             return {"ignored": "The event has no final message, and OptChat does not read transcripts."}
-        identity = event.get("event_id") or event.get("turn_id")
+        identity = event.get("event_id") or text_key(event)
         if not identity:
             raise ValueError("Stop needs a stable turn or event id. The hook client supplies one.")
         result = append("talk", text, identity)

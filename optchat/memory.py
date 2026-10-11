@@ -180,12 +180,14 @@ class Memory:
         if not terms:
             raise ValueError("The query has no words.")
         rank = {"user": 0, "talk": 1, "note": 2, "echo": 3, "tool": 4}
+        from .activity import stored_kind
         hits = []
         for m in self.store.root:
             text = m.text.casefold()
             found = [t for t in terms if t in text]
-            if found:
-                hits.append((-len(found), rank.get(m.kind, 5), -m.i, m, found))
+            kind = stored_kind(m.kind, m.text) if found else None
+            if kind:
+                hits.append((-len(found), rank.get(kind, 5), -m.i, m, found))
         hits.sort(key=lambda h: h[:3])
         lines = []
         for _, _, _, m, found in hits[:limit]:
