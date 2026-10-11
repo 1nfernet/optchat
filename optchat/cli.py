@@ -14,7 +14,9 @@ def parser():
     p.add_argument("--chat", type=Path, default=DEFAULT_CHAT)
     sub = p.add_subparsers(dest="command", required=True)
     mcp = sub.add_parser("mcp", help="Serve MCP over stdio, and start the memory service if it is not running")
-    mcp.add_argument("--memory-only", action="store_true", help="Offer only the memory tools, without the summary tools")
+    tools = mcp.add_mutually_exclusive_group()
+    tools.add_argument("--memory-only", action="store_true", help="Offer only the tools that read the memory")
+    tools.add_argument("--jobs", action="store_true", help="Offer only the job tools of the compactor subagent")
     srv = sub.add_parser("serve", help="Run the memory service in the foreground")
     srv.add_argument("--wait", action="store_true", help="If another copy holds the lock, wait for it and take over when it stops")
     sub.add_parser("status")
@@ -26,7 +28,8 @@ def parser():
     for name in ("export", "backup"):
         cmd = sub.add_parser(name); cmd.add_argument("output", type=Path)
     imp = sub.add_parser("import"); imp.add_argument("source", type=Path)
-    sub.add_parser("hook", help="Record a Claude Code hook event (JSON on stdin)")
+    hook = sub.add_parser("hook", help="Record a Claude Code or Codex hook event (JSON on stdin)")
+    hook.add_argument("--agent", choices=("claude", "codex"), default="claude", help="The program that runs the hook")
     sub.add_parser("status-line", help="One short line for the Claude Code status line; empty when little waits")
     call = sub.add_parser("call", help="Call a memory method with JSON arguments")
     call.add_argument("method"); call.add_argument("arguments", nargs="?", default="{}")
@@ -66,21 +69,23 @@ def main():
             return
         client = Client(args.chat, autostart=args.command != "stop")
         if args.command == "mcp":
-            from .mcp import MEMORY_TOOLS, TOOLS
-            serve_stdio(client, MEMORY_TOOLS if args.memory_only else TOOLS); return
+            from .mcp import JOB_TOOLS, MEMORY_TOOLS, TOOLS
+            serve_stdio(client, MEMORY_TOOLS if args.memory_only else JOB_TOOLS if args.jobs else TOOLS); return
         if args.command == "hook":
             event = json.load(sys.stdin)
             from .hooks import enqueue
-            current = enqueue(client.chat, event)
+            current = enqueue(client.chat, event, args.agent)
+            # Codex adds plain output of a prompt hook to the context, and it reads
+            # the output of a Stop hook as JSON. "{}" asks for nothing.
+            done = "{}" if args.agent == "codex" and event.get("hook_event_name") == "Stop" else ""
             if current is None:
+                print(done, end="")
                 return
             try:
                 result = client.call("flush_hooks", {"current": current})
             except (ValueError, RuntimeError, OSError) as exc:
                 print(f"OptChat: the hook event is saved on disk and will be delivered later: {exc}", file=sys.stderr)
-                return
-            if "hookSpecificOutput" in result:
-                print(json.dumps(result))
+            print(done, end="")
             return
         if args.command == "append":
             result = client.call("append", {"kind": args.kind, "text": args.text if args.text is not None else sys.stdin.read(), "event_id": args.event_id or str(uuid4())})

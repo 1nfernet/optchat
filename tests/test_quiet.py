@@ -48,15 +48,17 @@ class QuietMemory(unittest.TestCase):
         self.assertEqual(nxt["arrived_later"], 5)
         self.assertNotIn((0, 3), self.service.store.tree, "later messages wait for the next run")
 
-    def test_codex_gets_only_the_memory_tools_and_short_descriptions(self):
+    def test_chats_get_only_the_reading_tools_and_the_compactor_only_the_job_tools(self):
         import json
-        from optchat.mcp import MEMORY_TOOLS, TOOLS, dispatch
+        from optchat.mcp import JOB_TOOLS, MEMORY_TOOLS, TOOLS, dispatch
         names = [t["name"] for t in dispatch({"method": "tools/list"}, None, MEMORY_TOOLS)["tools"]]
-        self.assertEqual(names, ["append", "view", "search", "zoom", "date", "read_message"])
+        self.assertEqual(names, ["view", "search", "zoom", "date", "read_message"])
+        self.assertEqual([t["name"] for t in JOB_TOOLS], ["compact_next", "compact_read", "compact_submit", "compact_release"])
         with self.assertRaises(ValueError):
             dispatch({"method": "tools/call", "params": {"name": "compact_next", "arguments": {}}}, None, MEMORY_TOOLS)
+        self.assertNotIn("instructions", dispatch({"method": "initialize"}, None, MEMORY_TOOLS), "the global instructions cover it")
         seen = lambda tools: len(json.dumps([{k: t[k] for k in ("name", "description", "inputSchema")} for t in tools]))
-        self.assertLess(seen(MEMORY_TOOLS), 2500, "the tool text that a model reads")
+        self.assertLess(seen(MEMORY_TOOLS), 1600, "the tool text that a model reads")
         self.assertLess(seen(TOOLS), 4500)
 
     def test_append_reply_holds_no_hint_to_summarize(self):

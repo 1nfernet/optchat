@@ -234,7 +234,7 @@ def compact(event, root=None):
         tail = f", last line: {clip(last, 100)}" if last else ""
         n = lines(output)
         return {"group": "ran", "text": f"{clip(command, 120)} (ok, {n} line{'s' if n != 1 else ''} of output{tail})"}
-    if tool.startswith("mcp__optchat__"):
+    if tool.startswith(("mcp__optchat__", "mcp__optchat-jobs__")):
         return None
     brief = clip(json.dumps(data, ensure_ascii=False), 80) if data else ""
     return {"group": "used", "text": f"{tool} {brief}".strip()}

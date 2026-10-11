@@ -31,6 +31,17 @@ class InstallEdits(unittest.TestCase):
         self.assertEqual(merged_hooks(merged, False), original)
         self.assertEqual(merged_hooks({"hooks": {}}, False), {})
 
+    def test_codex_hooks_record_prompts_and_replies_in_the_background(self):
+        settings = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify"}]}]}}
+        merged = merged_hooks(copy.deepcopy(settings), True, "codex")
+        self.assertEqual(sorted(merged["hooks"]), ["Stop", "UserPromptSubmit"])
+        ours = merged["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+        self.assertEqual(ours, {"type": "command", "command": hook_command("codex"), "timeout": 10, "async": True})
+        self.assertTrue(hook_command("codex").endswith("hook --agent codex"))
+        self.assertEqual(len(merged["hooks"]["Stop"]), 2, "other Stop hooks stay")
+        self.assertEqual(merged_hooks(copy.deepcopy(merged), True, "codex"), merged, "idempotent")
+        self.assertEqual(merged_hooks(merged, False, "codex"), settings)
+
     def test_hooks_of_events_that_install_no_longer_uses_are_removed(self):
         old = {"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": hook_command(), "timeout": 10}]}]}}
         merged = merged_hooks(old, True)

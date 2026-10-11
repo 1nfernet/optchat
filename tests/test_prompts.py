@@ -86,6 +86,15 @@ class Prompts(unittest.TestCase):
         self.assertEqual(self.records(), [("echo", "Message from the session Perf runs:\nRegression found: 22 to 8 fps."),
                                           ("user", "The user ran in the terminal: git pull")])
 
+    def test_codex_chat_is_recorded_from_its_first_prompt_and_subagents_stay_out(self):
+        codex = lambda event: self.service.call("flush_hooks", {"current": enqueue(self.service.store.path, {"session_id": "c", **event}, "codex")})
+        codex({"hook_event_name": "UserPromptSubmit", "turn_id": "t1", "agent_id": "child", "prompt": "subagent task"})
+        codex({"hook_event_name": "UserPromptSubmit", "turn_id": "t1", "prompt": "rename the flag"})
+        codex({"hook_event_name": "UserPromptSubmit", "turn_id": "t1", "prompt": "and update the docs"})
+        codex({"hook_event_name": "Stop", "turn_id": "t1", "last_assistant_message": "Renamed and updated.", "stop_hook_active": False})
+        self.assertEqual(self.records(), [("user", "rename the flag"), ("user", "and update the docs"), ("talk", "Renamed and updated.")])
+        self.assertEqual({m.origin["agent"] for m in self.service.store.root}, {"codex"})
+
     def test_search_corrects_records_that_older_versions_stored(self):
         for k, (kind, text) in enumerate([
                 ("user", "where is the cache"),
@@ -97,6 +106,34 @@ class Prompts(unittest.TestCase):
         lines = self.service.call("search", {"query": "cache"})["text"].splitlines()
         self.assertEqual(lines[0], "3 messages match; the best 3 follow. zoom(id, 1) gives a whole message.")
         self.assertEqual([line.split("+")[0] for line in lines[1:]], ["0", "4", "1"], "a report stored as a prompt ranks as a report")
+
+
+class HookOutput(unittest.TestCase):
+    def test_hook_prints_nothing_for_a_prompt_and_an_empty_decision_for_a_codex_stop(self):
+        import json
+        import subprocess
+        import sys
+        import time
+        from optchat.service import Client
+        with tempfile.TemporaryDirectory() as temp:
+            chat = Path(temp) / "chat"
+            run = lambda agent, event: subprocess.run([sys.executable, "-m", "optchat", "--chat", str(chat), "hook", "--agent", agent],
+                                                      input=json.dumps({"session_id": "c", "turn_id": "t", **event}), text=True, capture_output=True, timeout=20)
+            try:
+                prompt = run("codex", {"hook_event_name": "UserPromptSubmit", "prompt": "hello"})
+                self.assertEqual((prompt.returncode, prompt.stdout), (0, ""), "plain output would enter the context")
+                stop = run("codex", {"hook_event_name": "Stop", "last_assistant_message": "hi"})
+                self.assertEqual((stop.returncode, stop.stdout), (0, "{}"))
+                claude = run("claude", {"hook_event_name": "Stop", "last_assistant_message": "hi"})
+                self.assertEqual(claude.stdout, "")
+                self.assertEqual(Client(chat).call("status")["messages"], 2)
+            finally:
+                client = Client(chat, autostart=False)
+                if client.path.exists():
+                    client.call("shutdown")
+                    deadline = time.monotonic() + 3
+                    while client.path.exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
 
 
 if __name__ == "__main__":

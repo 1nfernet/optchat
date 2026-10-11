@@ -15,7 +15,7 @@ The idea of a memory that consists of its own compressed history comes from the 
 - View: a list of tree lines that covers the whole history in about 128 KB. New messages are added at the end. When the view grows too large, the pair that is oldest for its size merges, so detail fades with age.
 - Compaction jobs: a job holds up to 10 tasks, for example consecutive messages or merges of two lines. The first job of a worker brings the view as context, and later jobs bring only the changes. A worker subagent calls `compact_next`, which returns the job text, and answers with `compact_submit`. The reply to a submit holds the next job, so each job costs one request. A worker sees at most 8,000 characters of a tool call or result, and the log keeps the original.
 - Cost: the `optchat-compactor` subagent runs on Claude Haiku, and only when you type `/optchat-compact`. A run covers the messages that existed when it started. The Claude Code status line shows how many messages wait, once at least 30 wait. Nothing about the backlog goes into the context of an agent.
-- Recording: Claude Code hooks record your prompts and the final replies of the agents word for word. The tool calls of one turn become one short record of what changed and what failed. Exploration is kept only as counts and a few file names, because its content stays on disk. Your answers to agent questions are kept in full. Subagent reports, also those of background subagents, and approved plans are kept up to 4,000 characters. Messages from other Claude sessions are kept up to 4,000 characters too. Claude Code also submits notices of the app and of background tasks as prompts. OptChat does not keep them. Codex agents record your messages and their final replies with `append`.
+- Recording: Claude Code hooks record your prompts and the final replies of the agents word for word. The tool calls of one turn become one short record of what changed and what failed. Exploration is kept only as counts and a few file names, because its content stays on disk. Your answers to agent questions are kept in full. Subagent reports, also those of background subagents, and approved plans are kept up to 4,000 characters. Messages from other Claude sessions are kept up to 4,000 characters too. Claude Code also submits notices of the app and of background tasks as prompts. OptChat does not keep them. Codex hooks record your prompts and the final replies of the agents. They run in the background, so they never delay a turn.
 
 ## Several machines without an owner
 
@@ -49,8 +49,9 @@ The first command prints every change. The second command makes the changes:
 
 - It writes `~/.config/optchat/config.json`.
 - It starts the service at login, with launchd on macOS or a systemd user unit on Linux.
-- It registers the `optchat` MCP server for Claude Code and Codex. Codex gets only the memory tools, because it never summarizes and loads every tool description into each session.
-- It adds the recording hooks, the `optchat-compactor` subagent, the `/optchat-compact` command and a status line to Claude Code. An existing status line stays.
+- It registers the `optchat` MCP server for Claude Code and Codex, with only the five tools that read the memory. Hooks record the chats, so agents never call a tool to record them.
+- It adds the recording hooks, the `optchat-compactor` subagent, the `/optchat-compact` command and a status line to Claude Code. An existing status line stays. The subagent starts its own server with the job tools, so other sessions never load them.
+- It adds the recording hooks to `~/.codex/hooks.json`. Codex runs a new hook only after you trust it once with `/hooks`.
 - It appends a short OptChat section to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`.
 
 Every changed file keeps a backup with a time stamp. `./run uninstall --apply` removes all of this and keeps the memory.
@@ -59,14 +60,15 @@ Without a config file, OptChat keeps a memory for one machine only.
 
 ## MCP tools
 
+Chats get the tools that read the memory (`run mcp --memory-only`):
+
 - `search(query, limit)`: find earlier messages by words. It returns up to 10 short lines with ids by default, so an agent does not need the whole view.
 - `view`: read the current view in pages. Follow `next_offset` with the same `snapshot`.
 - `zoom(id, n)`: open line `id+n` into its two halves. With `n` set to 1 it returns the original message, up to 12,000 characters. `read_message` gives the rest.
 - `read_message(id, offset)`: read a long original message in pages.
 - `date(id)`: the time of message `id`.
-- `append(event_id, kind, text, origin)`: record a message. The kinds are `user`, `talk`, `tool`, `echo` and `note`.
-- `status`: the backlog, failed jobs, the hook queue and the replication state.
-- `compact_next`, `compact_read`, `compact_submit`, `compact_release`, `compact_resume`: the job protocol of the worker subagent.
+
+The compactor subagent gets the job tools (`run mcp --jobs`): `compact_next`, `compact_read`, `compact_submit` and `compact_release`. `run mcp` without an option offers all tools, also `append(event_id, kind, text, origin)`, `status` and `compact_resume`.
 
 ## Commands
 

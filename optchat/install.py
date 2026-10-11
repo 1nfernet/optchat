@@ -24,10 +24,14 @@ CONFIG = HOME / ".config/optchat/config.json"
 LABEL = "optchat.memory"
 BEGIN, END = "<!-- optchat:begin -->", "<!-- optchat:end -->"
 HOOK_EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PostToolUse": ".*", "PostToolUseFailure": ".*", "Stop": None}
+# Codex records the words of the chat. Its hooks run in the background, so they never
+# delay a turn, and their output never reaches the context.
+CODEX_HOOK_EVENTS = {"UserPromptSubmit": None, "Stop": None}
+MCP_ARGS = ["mcp", "--memory-only"]
 
 
-def hook_command():
-    return f"{RUN} hook"
+def hook_command(agent="claude"):
+    return f"{RUN} hook" + (" --agent codex" if agent == "codex" else "")
 
 
 def python():
@@ -102,16 +106,20 @@ def managed_block(text: str, block: str | None) -> str:
     return text.rstrip("\n") + ("\n\n" if text.strip() else "") + f"{BEGIN}\n{block.strip()}\n{END}\n"
 
 
-def merged_hooks(settings: dict, install: bool) -> dict:
+def merged_hooks(settings: dict, install: bool, agent="claude") -> dict:
+    events = CODEX_HOOK_EVENTS if agent == "codex" else HOOK_EVENTS
     hooks = settings.setdefault("hooks", {})
-    command = hook_command()
+    command = hook_command(agent)
     # Remove the OptChat hook from every event, also from events that install
     # no longer uses, then add it back for the current events.
-    for event in list(hooks) + [e for e in HOOK_EVENTS if e not in hooks]:
-        matcher = HOOK_EVENTS.get(event)
+    for event in list(hooks) + [e for e in events if e not in hooks]:
+        matcher = events.get(event)
         entries = [e for e in hooks.get(event, []) if not any(h.get("command") == command for h in e.get("hooks", []))]
-        if install and event in HOOK_EVENTS:
-            entry = {"hooks": [{"type": "command", "command": command, "timeout": 10}]}
+        if install and event in events:
+            handler = {"type": "command", "command": command, "timeout": 10}
+            if agent == "codex":
+                handler["async"] = True
+            entry = {"hooks": [handler]}
             if matcher:
                 entry = {"matcher": matcher, **entry}
             entries.append(entry)
@@ -129,13 +137,17 @@ def registered(cli, name="optchat"):
     return exe is not None and subprocess.run([exe, "mcp", "get", name], capture_output=True).returncode == 0
 
 
-def codex_args(name="optchat"):
-    """The arguments with which Codex starts the server, or None."""
-    exe = shutil.which("codex")
-    found = exe and subprocess.run([exe, "mcp", "get", name, "--json"], capture_output=True, text=True)
+def server_args(cli, name="optchat"):
+    """The arguments with which Claude Code or Codex starts the server, or None."""
+    exe = shutil.which(cli)
+    found = exe and subprocess.run([exe, "mcp", "get", name] + (["--json"] if cli == "codex" else []), capture_output=True, text=True)
+    if not found or found.returncode:
+        return None
     try:
-        return json.loads(found.stdout)["transport"]["args"] if found and found.returncode == 0 else None
-    except (ValueError, KeyError, TypeError):
+        if cli == "codex":
+            return json.loads(found.stdout)["transport"]["args"]
+        return next(line.split(":", 1)[1].split() for line in found.stdout.splitlines() if line.strip().startswith("Args:"))
+    except (ValueError, KeyError, TypeError, StopIteration):
         return None
 
 
@@ -174,19 +186,19 @@ def install(args):
         plan.run(["systemctl", "--user", "enable", "optchat.service"], "start at boot")
         plan.run(["systemctl", "--user", "restart", "optchat.service"], "start now with the current code")
 
-    # MCP for Claude Code and Codex. Codex gets only the memory tools: it never summarizes,
-    # and it loads every tool description into each session.
-    for cli, argv in (("claude", ["claude", "mcp", "add", "--scope", "user", "optchat", "--", RUN, "mcp"]),
-                      ("codex", ["codex", "mcp", "add", "optchat", "--", RUN, "mcp", "--memory-only"])):
+    # MCP for Claude Code and Codex: only the tools that read the memory. Hooks record
+    # the chats, and the compactor subagent starts its own server with the job tools.
+    for cli, add, remove in (("claude", ["claude", "mcp", "add", "--scope", "user"], ["claude", "mcp", "remove", "--scope", "user", "optchat"]),
+                             ("codex", ["codex", "mcp", "add"], ["codex", "mcp", "remove", "optchat"])):
+        args_now = server_args(cli) if shutil.which(cli) else None
         if not shutil.which(cli):
             print(f"  skip {cli}: not installed")
-        elif cli == "codex" and registered(cli) and codex_args() != argv[-2:]:
-            plan.run(["codex", "mcp", "remove", "optchat"], "remove the old Codex registration")
-            plan.run(argv, "offer only the memory tools in every Codex session")
-        elif registered(cli):
+        elif args_now == MCP_ARGS:
             print(f"  ok  {cli} MCP server 'optchat' already registered")
         else:
-            plan.run(argv, f"make the memory tools available in every {cli} session")
+            if args_now is not None:
+                plan.run(remove, f"remove the old {cli} registration")
+            plan.run(add + ["optchat", "--", RUN, *MCP_ARGS], f"offer the memory tools in every {cli} session")
 
     # Hooks record every Claude session. The compactor subagent writes summaries.
     claude_home = HOME / ".claude"
@@ -198,8 +210,16 @@ def install(args):
             # The backlog shows in the status line, outside the context of any agent.
             settings["statusLine"] = {"type": "command", "command": f"{RUN} status-line"}
         plan.write(settings_path, json.dumps(settings, indent=2) + "\n", "hooks that record every Claude session, and the status line")
-        plan.write(claude_home / "agents/optchat-compactor.md", (REPO / "integrations/optchat-compactor.md").read_text(), "compaction subagent")
+        agent = (REPO / "integrations/optchat-compactor.md").read_text().replace("{RUN}", str(RUN))
+        plan.write(claude_home / "agents/optchat-compactor.md", agent, "compaction subagent with its own job server")
         plan.write(claude_home / "commands/optchat-compact.md", (REPO / "integrations/optchat-compact-command.md").read_text(), "the /optchat-compact command")
+
+    # Hooks record every Codex session.
+    codex_home = HOME / ".codex"
+    if codex_home.exists() or shutil.which("codex"):
+        path = codex_home / "hooks.json"
+        hooks = merged_hooks(json.loads(path.read_text()) if path.exists() else {}, True, "codex")
+        plan.write(path, json.dumps(hooks, indent=2) + "\n", "hooks that record every Codex session; trust them once with /hooks in Codex")
 
     # Instructions for every agent.
     block = (REPO / "integrations/AGENTS.optchat.md").read_text()
@@ -229,6 +249,9 @@ def uninstall(args):
         if settings.get("statusLine", {}).get("command") == f"{RUN} status-line":
             settings.pop("statusLine")
         plan.write(settings_path, json.dumps(settings, indent=2) + "\n", "remove OptChat hooks and status line")
+    codex_hooks = HOME / ".codex/hooks.json"
+    if codex_hooks.exists():
+        plan.write(codex_hooks, json.dumps(merged_hooks(json.loads(codex_hooks.read_text()), False, "codex"), indent=2) + "\n", "remove OptChat hooks")
     plan.remove(HOME / ".claude/agents/optchat-compactor.md", "compaction subagent")
     plan.remove(HOME / ".claude/commands/optchat-compact.md", "the /optchat-compact command")
     for path in (HOME / ".claude/CLAUDE.md", HOME / ".codex/AGENTS.md"):

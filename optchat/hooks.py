@@ -16,7 +16,7 @@ def ignored(event):
     if event.get("agent_id") or event.get("agent_type") == "optchat-compactor":
         return "subagent"
     tool = event.get("tool_name", "")
-    if tool.startswith("mcp__optchat__") or (tool in ("Agent", "Task") and "optchat-compactor" in json_text(event.get("tool_input", {}))):
+    if tool.startswith(("mcp__optchat__", "mcp__optchat-jobs__")) or (tool in ("Agent", "Task") and "optchat-compactor" in json_text(event.get("tool_input", {}))):
         return "memory or compaction traffic"
     return None
 
@@ -28,17 +28,18 @@ def text_key(event):
     if event.get("hook_event_name") == "Stop":
         base, text = event.get("turn_id") or event.get("prompt_id"), event.get("last_assistant_message")
     else:
-        base, text = event.get("prompt_id") or event.get("user_message_id"), event.get("prompt")
+        base, text = event.get("prompt_id") or event.get("user_message_id") or event.get("turn_id"), event.get("prompt")
     text = valid_unicode(text) if isinstance(text, str) else ""
     return f"{base}:{hashlib.sha256(text.encode()).hexdigest()}" if base else None
 
 
-def enqueue(chat, event):
+def enqueue(chat, event, agent="claude"):
     """Write the event to disk before delivery. The next service call delivers any event that is still on disk."""
     if ignored(event):
         return None
     fields = {"hook_event_name", "session_id", "cwd", "agent_type", "agent_id", "event_id", "prompt_id", "user_message_id", "turn_id", "prompt", "tool_name", "tool_input", "tool_use_id", "tool_response", "error", "last_assistant_message"}
     event = {key: value for key, value in event.items() if key in fields}
+    event["client"] = agent
     if not event.get("event_id"):
         key = text_key(event) if event.get("hook_event_name") in ("Stop", "UserPromptSubmit") else None
         event["event_id"] = key or event.get("prompt_id") or event.get("user_message_id") or str(uuid4())
@@ -92,12 +93,15 @@ def ingest(service, event):
         # instructions already say when to use the memory.
         service.ledger.session(session, "main")
         return {"enrolled": session}
-    # Only a SessionStart event enrolls a session. A child without agent_id must
-    # never become a main session through a tool event.
+    # In Claude Code only a SessionStart event enrolls a session: a child without
+    # agent_id must never become a main session through a tool event. Codex marks
+    # every subagent event with agent_id, so its sessions enroll at the first prompt.
+    if event.get("client") == "codex" and name == "UserPromptSubmit":
+        service.ledger.session(session, "main")
     if service.ledger.session(session) != "main":
         return {"ignored": "session not enrolled by SessionStart"}
     keybase = session + ":" + name + ":"
-    origin = {"session": session, "agent": "claude"}
+    origin = {"session": session, "agent": event.get("client") or "claude"}
     if event.get("cwd"):
         origin["project"] = project_root(event["cwd"])
     def append(kind, text, identity):
