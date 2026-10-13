@@ -14,30 +14,35 @@ from optchat.jobs import STATUS_AT
 from optchat.service import Service
 
 
-def answer(lines, stop="end_turn"):
+def answer(lines, stop="end_turn", numbers=None):
     import json
-    return {"content": [{"type": "thinking", "thinking": "", "signature": "sig"}, {"type": "text", "text": json.dumps({"lines": lines})}],
+    entries = [{"task": n, "line": line} for n, line in zip(numbers or range(1, len(lines) + 1), lines)]
+    return {"content": [{"type": "thinking", "thinking": "", "signature": "sig"}, {"type": "text", "text": json.dumps({"lines": entries})}],
             "stop_reason": stop, "usage": {"input_tokens": 1000, "output_tokens": 100}}
 
 
 class FakeApi:
     """Answers each job with one short line per task, and keeps a copy of every request."""
 
-    def __init__(self, empty_first=False):
-        self.requests, self.empty_first, self.n = [], empty_first, 0
+    def __init__(self, empty_first=False, skip_once=None):
+        self.requests, self.empty_first, self.skip_once, self.n = [], empty_first, skip_once, 0
 
     def __call__(self, key, messages):
         self.requests.append([dict(m) for m in messages])
         last = messages[-1]["content"]
-        found = re.search(r"This job has (\d+) task", last) or re.search(r"Answer with (\d+) new line", last) or re.search(r"Answer again with (\d+) lines", last)
+        job = re.search(r"This job has (\d+) task", last)
+        numbers = list(range(1, int(job.group(1)) + 1)) if job else [int(n) for n in re.search(r"each of these tasks: ([\d, ]+)\.", last).group(1).split(", ")]
         lines = []
-        for _ in range(int(found.group(1))):
+        for _ in numbers:
             self.n += 1
             lines.append(f"note: summary {self.n}")
         if self.empty_first:
             self.empty_first = False
             lines[0] = ""
-        return answer(lines)
+        if self.skip_once and len(numbers) > 1:
+            self.skip_once = False
+            return answer(lines[1:], numbers=numbers[1:])
+        return answer(lines, numbers=numbers)
 
 
 class ApiWorker(unittest.TestCase):
@@ -93,6 +98,15 @@ class ApiWorker(unittest.TestCase):
         self.service.api_enabled = True
         self.assertEqual(self.service.call("status_line", {})["text"], f"OptChat: {STATUS_AT} to summarize, API: no credit")
         self.assertEqual(self.service.call("compact_next", {})["status"], "claimed")
+
+    def test_a_missing_task_is_asked_again(self):
+        self.note(3)
+        fake = FakeApi(skip_once=True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.compact(fake)
+        self.assertEqual(self.service.board.failures, {})
+        self.assertEqual(self.service.api.last["lines"], 3)
+        self.assertIn("no line for task 1", fake.requests[1][-1]["content"])
 
     def test_an_empty_line_releases_only_its_task(self):
         self.note(3)
