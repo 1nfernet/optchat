@@ -206,3 +206,17 @@ class RcloneWrites(unittest.TestCase):
         self.assertEqual(calls[0][:2], ["rclone", "rcat"])
         self.assertEqual(calls[1][:3], ["rclone", "moveto", "--ignore-times"])
         self.assertTrue(calls[1][-1].endswith("heartbeat.json"))
+
+    def test_the_data_goes_on_stdin_and_never_on_the_command_line(self):
+        calls = []
+        def fake_run(argv, input=None, **kw):
+            calls.append((argv, input))
+            class Done: returncode, stdout, stderr = 0, b"", b""
+            return Done()
+        with patch("optchat.replica.subprocess.run", fake_run):
+            ex = RcloneExchange("remote:optchat", rclone="rclone")
+            ex.write("machines/m-000000/api-key.json", b'{"key":"sk-ant-secret"}')
+            ex.delete("machines/m-000000/api-key.json")
+        self.assertEqual(calls[0][1], b'{"key":"sk-ant-secret"}')
+        self.assertFalse(any("sk-ant" in " ".join(argv) for argv, _ in calls))
+        self.assertEqual(calls[2][0][:2], ["rclone", "deletefile"])

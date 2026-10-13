@@ -5,6 +5,12 @@ summaries. With a key, the service takes the compaction jobs itself and sends th
 Claude Haiku. When a request fails, for example because the organization has no credit
 left, the service pauses the API, and the subagent of /optchat-compact takes the jobs.
 
+The key can come from another machine. The machine where the user ran `run api-key`
+writes it to machines/<its id>/api-key.json in the shared folder and puts the date of
+the change in its heartbeat. A machine that sees a newer date there reads the file and
+stores the key. The heartbeat never holds the key. Of the machines whose API is ready,
+the first by id writes the summaries, so the machines never pay twice for one line.
+
 OptChat has no dependencies, so this module calls the HTTP API with urllib.
 """
 from __future__ import annotations
@@ -23,11 +29,12 @@ import urllib.error
 import urllib.request
 
 from .config import config_path
-from .util import atomic_json
+from .util import atomic_json, json_text
 
 KEY_URL = "https://platform.claude.com/settings/keys"
 BILLING_URL = "https://platform.claude.com/settings/billing"
 ENDPOINT = "https://api.anthropic.com/v1/messages"
+SHARED = "api-key.json"  # In machines/<id>/ of the shared folder.
 MODEL = "claude-haiku-5-5"
 EFFORT = "low"  # The compactor subagent runs at low effort too.
 MAX_TOKENS = 16_000
@@ -65,15 +72,19 @@ def key_path():
     return config_path().parent / "anthropic-api-key"
 
 
-def load_key():
+def load_key(path=None):
     try:
-        return key_path().read_text().strip() or None
+        return (path or key_path()).read_text().strip() or None
     except FileNotFoundError:
         return None
 
 
-def save_key(key):
-    path = key_path()
+def remove_key(path=None):
+    (path or key_path()).unlink(missing_ok=True)
+
+
+def save_key(key, path=None):
+    path = path or key_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -86,6 +97,19 @@ def save_key(key):
 
 def fingerprint(key):
     return hashlib.sha256(key.encode()).hexdigest()[:12] if key else None
+
+
+def publish(exchange, machine, key, date):
+    """Write the key, or None after a removal, to the folder of this machine. rclone gets the data on stdin."""
+    exchange.write(f"machines/{machine}/{SHARED}", json_text({"key": key, "date": date}).encode())
+
+
+def fetch(exchange, machine):
+    raw = exchange.read(f"machines/{machine}/{SHARED}")
+    data = json.loads(raw) if raw else None
+    if not isinstance(data, dict) or not isinstance(data.get("date"), (int, float)) or not (data.get("key") is None or isinstance(data["key"], str)):
+        return None
+    return data
 
 
 def classify(status, body, retry_after=None):
@@ -166,10 +190,14 @@ def lines_of(response):
 class ApiCompactor:
     """The API worker of one service. It runs on the event loop of the service and calls the API on a thread."""
 
-    def __init__(self, chat_path, clock=time.time):
+    def __init__(self, chat_path, clock=time.time, key_file=None):
         self.path = chat_path / "api.json"
         saved = json.loads(self.path.read_text()) if self.path.exists() else {}
         self.total = saved.get("total", {"lines": 0, "requests": 0, "usd": 0.0})
+        # date: when the user last stored or removed a key on any machine. own: this
+        # machine wrote that change to the shared folder. pending: it has yet to write it.
+        self.key_info = saved.get("key", {})
+        self.key_file = key_file or key_path()
         self.clock = clock
         self.problem = None  # {"kind", "message", "key", "until"} after a failed request.
         self.run = 0
@@ -181,7 +209,42 @@ class ApiCompactor:
         self.ask = ask  # Tests replace it.
 
     def save(self):
-        atomic_json(self.path, {"total": self.total})
+        atomic_json(self.path, {"total": self.total, "key": self.key_info})
+
+    def load_key(self):
+        return load_key(self.key_file)
+
+    def key_changed(self):
+        """The user stored or removed the key on this machine. The next exchange shares the change."""
+        self.key_info = {"date": self.clock(), "own": True, "pending": True}
+        self.problem = None
+        self.save()
+
+    def heartbeat(self, enabled):
+        """The part of the heartbeat that other machines read: no key, only whether the API works here and the date of a shared key."""
+        info = self.key_info
+        return {"ready": bool(enabled and self.ready(self.load_key())), "key": info["date"] if info.get("own") and not info.get("pending") else None}
+
+    def newer(self, beats):
+        """The machine that shared the newest key change, if it is newer than the key here. beats: machine id -> its api heartbeat."""
+        best = None
+        for mid, beat in beats.items():
+            date = (beat or {}).get("key")
+            if isinstance(date, (int, float)) and date > self.key_info.get("date", 0) and (best is None or date > best[1]):
+                best = (mid, date)
+        return best
+
+    def adopt(self, data, machine):
+        """Store a key that another machine shared. Returns True when this machine must delete its own older shared file."""
+        if data["key"]:
+            save_key(data["key"], self.key_file)
+        else:
+            remove_key(self.key_file)
+        had_own = bool(self.key_info.get("own"))
+        self.key_info = {"date": data["date"], "from": machine}
+        self.problem = None
+        self.save()
+        return had_own
 
     def state(self, key):
         if key is None:
@@ -199,6 +262,8 @@ class ApiCompactor:
             state["retry_at"] = self.problem["until"]
         if key is None:
             state["key_url"] = KEY_URL
+        elif self.key_info.get("from"):
+            state["key_from"] = self.key_info["from"]
         return state
 
     def note(self, key):
@@ -326,14 +391,27 @@ def open_page(url):
             pass
 
 
-def key_command(remove=False, browser=True, read=getpass.getpass, checker=check):
+def share(notify):
+    """Tell the memory service about the change. It shares the change with the other machines."""
+    try:
+        shared = notify().get("shared")
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(f"The memory service did not get the change ({exc}). Other machines keep their key.")
+        return
+    if shared:
+        print("The other machines get this change from the shared folder within about a minute.")
+
+
+def key_command(remove=False, browser=True, read=getpass.getpass, checker=check, notify=None):
     path = key_path()
     if remove:
         if path.exists():
             path.unlink()
             print(f"Removed {path}. The subagent of /optchat-compact writes the summaries again.")
         else:
-            print("No API key is stored.")
+            print("No API key is stored here.")
+        if notify:
+            share(notify)
         return 0
     print("OptChat can write summaries with Claude Haiku on your Anthropic API credit.")
     print("Create a key in the Claude Console, then copy it:")
@@ -360,10 +438,12 @@ def key_command(remove=False, browser=True, read=getpass.getpass, checker=check)
             print(f"Add credit at {BILLING_URL}. Until then the subagent of /optchat-compact writes the summaries.")
         else:
             print(f"Saved in {path}. The check failed ({exc}). The memory service tries again later.")
-        return 0
-    save_key(key)
-    print(f"The key works. Saved in {path}, which only your user can read.")
-    print(f"The memory service sends summary jobs to the API once {API_AT} wait, or once fewer have waited for {IDLE // 60} minutes.")
+    else:
+        save_key(key)
+        print(f"The key works. Saved in {path}, which only your user can read.")
+        print(f"The memory service sends summary jobs to the API once {API_AT} wait, or once fewer have waited for {IDLE // 60} minutes.")
+    if notify:
+        share(notify)
     return 0
 
 

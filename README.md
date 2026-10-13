@@ -25,6 +25,12 @@ The idea of a memory that consists of its own compressed history comes from the 
 
 The command prints the link to the key page of the Claude Console, https://platform.claude.com/settings/keys, and opens it when the machine has a desktop. You paste the key, and the input stays hidden. One request of a few tokens checks the key, and the key goes to `~/.config/optchat/anthropic-api-key`, which only your user can read. `./run api-key --remove` deletes it.
 
+Run the command on one machine. The other machines get the key through the shared folder within about a minute, and a removal reaches them the same way:
+
+- The machine writes `{"key": ..., "date": ...}` to `machines/<its id>/api-key.json`. rclone gets the data on stdin, so the key never appears on a command line.
+- Its heartbeat holds only the date of the change. A machine that sees a newer date reads the file and stores the key in its own `~/.config/optchat/anthropic-api-key`. A machine that had shared an older key deletes its file.
+- The key has the same protection as the memory: an encrypted remote keeps it encrypted at rest, and whoever can read the shared folder can read the key. Give the key its own workspace with a spend limit in the Console, so that a leaked key can spend only that limit. Revoke it in the Console if a machine is lost.
+
 With a key, the memory service sends the compaction jobs to Claude Haiku 5.5 (`claude-haiku-5-5`, low effort). It starts once 10 summaries wait, or once fewer have waited for 10 minutes without new messages. Each worker is one conversation in the prompt cache, so a job costs a small fraction of a cent. `./run status` shows the lines written and the estimated dollars under `api`.
 
 When a request fails, the service pauses the API and gives the job back, and the job does not count as a failure of the messages:
@@ -39,7 +45,7 @@ When a request fails, the service pauses the API and gives the job back, and the
 
 While the API is paused, the status line says why, for example `OptChat: 45 to summarize, API: no credit`. `/optchat-compact` first runs `./run compact`, which asks the service to try the API at once. When the API works, the service writes the summaries in the background. When it fails or no key is stored, the agent starts the compactor subagent as before.
 
-Only a machine with a key uses the API. When several machines have a key, two of them can summarize the same new messages at the same time. The summaries stay correct, and the second costs a little.
+Each heartbeat says whether the API works on that machine. Of the online machines whose API works, the first by machine id writes the summaries, and the other machines get the lines through the shared folder. When that machine goes offline or its API pauses, the next one takes over. `./run status` shows `runs_here` under `api`. `/optchat-compact` tries the API on its own machine in any case.
 
 ## Several machines without an owner
 

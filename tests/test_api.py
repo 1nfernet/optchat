@@ -221,3 +221,63 @@ class CompactCommand(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedKey(unittest.TestCase):
+    """A key that the user stores on one machine reaches the others through the shared folder."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env = patch.dict(os.environ, {"OPTCHAT_CONFIG": str(self.root / "unused/config.json")})
+        self.env.start()
+        self.now = [1_800_000_000.0]
+        self.a, self.b = self.start("alpha"), self.start("beta")
+
+    def tearDown(self):
+        self.a.close()
+        self.b.close()
+        self.env.stop()
+        self.temp.cleanup()
+
+    def start(self, name):
+        config = {"machine": name, "exchange": {"type": "dir", "path": str(self.root / "shared")}, "join_grace": 0}
+        service = Service(self.root / name, config=config, clock=lambda: self.now[0])
+        service.api.key_file = self.root / name / "key"
+        return service
+
+    def rounds(self, *services):
+        for service in services:
+            asyncio.run(service.exchange())
+
+    def shared(self, service):
+        return self.root / "shared/machines" / service.replica.machine
+
+    def test_a_key_stored_on_one_machine_reaches_the_other_and_a_removal_too(self):
+        api.save_key("sk-ant-from-alpha", self.a.api.key_file)
+        self.assertEqual(self.a.call("api_key_changed", {}), {"shared": True})
+        self.rounds(self.a, self.a, self.b)
+        self.assertEqual(self.b.api.load_key(), "sk-ant-from-alpha")
+        self.assertEqual(stat.S_IMODE(self.b.api.key_file.stat().st_mode), 0o600)
+        self.assertEqual(self.b.call("api_status", {})["key_from"], self.a.replica.machine)
+        for service in (self.a, self.b):
+            self.assertNotIn("sk-ant", (self.shared(service) / "heartbeat.json").read_text(), "a heartbeat never holds the key")
+        self.now[0] += 60
+        api.remove_key(self.b.api.key_file)
+        self.b.call("api_key_changed", {})
+        self.rounds(self.b, self.b, self.a)
+        self.assertIsNone(self.a.api.load_key())
+        self.assertFalse((self.shared(self.a) / api.SHARED).exists(), "the older shared key is deleted")
+        self.rounds(self.a, self.b)
+        self.assertIsNone(self.b.api.load_key(), "an older change never comes back")
+
+    def test_only_the_first_ready_machine_runs_the_api(self):
+        for service in (self.a, self.b):
+            api.save_key("sk-ant-same", service.api.key_file)
+        self.rounds(self.a, self.b, self.a)
+        first, second = sorted((self.a, self.b), key=lambda s: s.replica.machine)
+        self.assertTrue(first.api_turn())
+        self.assertFalse(second.api_turn())
+        first.api.pause(api.ApiError("unreachable", "no network"), "sk-ant-same")
+        self.rounds(first, second)
+        self.assertTrue(second.api_turn(), "the next machine takes over while the first one is paused")

@@ -81,7 +81,7 @@ class Service:
                 "failures": {f"{i*2**l}+{2**l}": {"reason": reason, "blocked": b.blocked(Part(l, i))} for (l, i), reason in b.failures.items()},
                 "queued_hook_events": len(list((self.store.path / 'spool').glob('*.json'))),
                 "rejected_hook_events": len(list((self.store.path / 'spool' / 'failed').glob('*.json'))), "model_processes": 0,
-                "replication": self.replica.status(), "api": self.api.state(api.load_key()) if self.api_enabled else {"status": "off"}}
+                "replication": self.replica.status(), "api": {**self.api.state(self.api.load_key()), "runs_here": self.api_turn()} if self.api_enabled else {"status": "off"}}
 
     def call(self, method, args, client="local"):
         if not self.draining and method not in ("hook", "flush_hooks", "shutdown"):
@@ -109,14 +109,17 @@ class Service:
             waiting = len(self.board.backlog())
             if waiting < STATUS_AT:
                 return {"text": ""}
-            note = self.api.note(api.load_key()) if self.api_enabled else ""
+            note = self.api.note(self.api.load_key()) if self.api_enabled else ""
             return {"text": f"OptChat: {waiting} to summarize" + (f", {note}" if note else "")}
+        if method == "api_key_changed":
+            self.api.key_changed()
+            return {"shared": bool(self.api_enabled and self.replica.exchange)}
         if method == "api_status":
-            return self.api.state(api.load_key())
+            return self.api.state(self.api.load_key())
         if method == "api_compact":
             if not self.api_enabled:
                 return {"status": "off", "reason": "this memory has no machine config, so it does not use the API"}
-            key = api.load_key()
+            key = self.api.load_key()
             if key is None:
                 return self.api.state(None)
             if not self.api.running:
@@ -279,11 +282,9 @@ class Service:
 
     async def replicate(self):
         """Exchange data with the shared folder every `interval` seconds. Network I/O runs on a worker thread."""
-        loop = asyncio.get_running_loop()
         while not self.stopping.is_set():
             try:
-                result = await loop.run_in_executor(None, self.replica.exchange_round, self.replica.outgoing())
-                self.replica.apply(result)
+                await self.exchange()
             except StorageError:
                 self.stopping.set()
                 raise
@@ -314,8 +315,8 @@ class Service:
                 pass
             forced, self.api.forced = self.api.forced, False
             self.api.wake.clear()
-            key = api.load_key()
-            if not self.api.ready(key, forced) or not (forced or self.api.due(self.memory.total, self.model_work())):
+            key = self.api.load_key()
+            if not self.api.ready(key, forced) or not (forced or (self.api_turn() and self.api.due(self.memory.total, self.model_work()))):
                 continue
             try:
                 await self.api.compact(self.call, key)
@@ -325,6 +326,36 @@ class Service:
                 # A fault here must not stop the memory. The subagent can still write the summaries.
                 self.api.pause(api.ApiError("error", f"API worker: {exc}"), key)
                 print(f"API worker: {exc}", file=sys.stderr, flush=True)
+
+    async def exchange(self):
+        """One exchange round with the shared folder, and the API key that the machines share through it."""
+        loop = asyncio.get_running_loop()
+        out = self.replica.outgoing()
+        out["api"] = self.api.heartbeat(self.api_enabled)
+        self.replica.apply(await loop.run_in_executor(None, self.replica.exchange_round, out))
+        if not self.api_enabled:
+            return
+        ex, me = self.replica.exchange, self.replica.machine
+        info = self.api.key_info
+        if info.get("pending"):
+            await loop.run_in_executor(None, api.publish, ex, me, self.api.load_key(), info["date"])
+            if self.api.key_info is info:  # The user did not change the key again meanwhile.
+                info["pending"] = False
+                self.api.save()
+        found = self.api.newer({mid: (beat.get("heartbeat") or {}).get("api") for mid, beat in self.replica.state["machines"].items()})
+        if found:
+            data = await loop.run_in_executor(None, api.fetch, ex, found[0])
+            # The heartbeat can arrive before the file. Then the next round tries again.
+            if data and data["date"] == found[1] and self.api.newer({found[0]: {"key": data["date"]}}) and self.api.adopt(data, found[0]):
+                await loop.run_in_executor(None, ex.delete, f"machines/{me}/{api.SHARED}")
+
+    def api_turn(self):
+        """True when this machine writes the summaries with the API: it is the first, by id, of the online machines whose API is ready."""
+        if not self.replica.exchange:
+            return True
+        online = self.replica.watermarks(self.replica.clock())
+        ready = [mid for mid in online if ((self.replica.state["machines"][mid].get("heartbeat") or {}).get("api") or {}).get("ready")]
+        return all(self.replica.machine < mid for mid in ready)
 
     def close(self):
         self.ledger.close()

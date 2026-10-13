@@ -100,6 +100,9 @@ class DirExchange:
         except FileNotFoundError:
             return None
 
+    def delete(self, rel):
+        (self.root / rel).unlink(missing_ok=True)
+
     def write(self, rel, data: bytes):
         path = self.root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,6 +147,9 @@ class RcloneExchange:
 
     def read(self, rel):
         return self._run("cat", self._path(rel), missing_ok=True)
+
+    def delete(self, rel):
+        self._run("deletefile", self._path(rel), missing_ok=True)
 
     def write(self, rel, data: bytes):
         tmp = f"{rel}.{secrets.token_hex(4)}.tmp"
@@ -366,6 +372,8 @@ class Replica:
         watermark = stamp(pending_own[0].get("odate", pending_own[0]["date"])) - 1e-6 if pending_own else now
         heartbeat = {"machine": self.machine, "name": self.name, "updated": iso(now), "watermark": iso(watermark),
                      "seq": result["uploaded_seq"], "sum": result["uploaded_sum"]}
+        if out.get("api"):
+            heartbeat["api"] = out["api"]  # Whether the API works there, and the date of a shared key; never the key.
         ex.write(f"{me}/heartbeat.json", json_text(heartbeat).encode())
         result["heartbeat"] = heartbeat["updated"]
         for mid in ex.dirs("machines"):

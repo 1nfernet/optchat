@@ -63,7 +63,7 @@ def main():
             return
         if args.command == "api-key":
             from .api import key_command
-            raise SystemExit(key_command(remove=args.remove, browser=not args.no_browser))
+            raise SystemExit(key_command(remove=args.remove, browser=not args.no_browser, notify=lambda: Client(args.chat).call("api_key_changed")))
         if args.command == "serve":
             from .config import load_config
             asyncio.run(Service(args.chat, config=load_config(args.chat), wait=args.wait).serve()); return
