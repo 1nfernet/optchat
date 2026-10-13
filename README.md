@@ -4,7 +4,7 @@ OptChat keeps one memory for the Claude Code and Codex agents of one user, on al
 
 The messages are folded into a binary tree of one-line summaries. The view, about 128 KB, covers the whole history: recent messages have one line each, and older lines cover more messages. When a line is too vague, an agent opens it into the two lines from which it was made, down to the original message. An agent uses the memory only when its task needs it, and starts with a search by words.
 
-OptChat is an MCP server in Python 3.11 or newer, with no dependencies. It never runs a model and needs no API key. The agents write the summaries themselves. When you type `/optchat-compact`, the agent starts a small subagent, which takes jobs through MCP tools and submits the summary lines.
+OptChat is an MCP server in Python 3.11 or newer, with no dependencies. Without an API key it runs no model, and the agents write the summaries themselves: when you type `/optchat-compact`, the agent starts a small subagent, which takes jobs through MCP tools and submits the summary lines. When you store an Anthropic API key, the service writes the summaries itself with Claude Haiku on your API credit, and the subagent takes over whenever the API fails.
 
 The idea of a memory that consists of its own compressed history comes from the OptChat design, which grew out of [OptMem](https://github.com/VictorTaelin/OptMem). This repository does not include the original specification.
 
@@ -14,8 +14,32 @@ The idea of a memory that consists of its own compressed history comes from the 
 - Tree: each message gets a summary line of at most 512 bytes. Two neighboring lines merge into one line, two of those merge again, and so on. A short message or a short pair of lines needs no model, because it is its own line.
 - View: a list of tree lines that covers the whole history in about 128 KB. New messages are added at the end. When the view grows too large, the pair that is oldest for its size merges, so detail fades with age.
 - Compaction jobs: a job holds up to 10 tasks, for example consecutive messages or merges of two lines. The first job of a worker brings the view as context, and later jobs bring only the changes. A worker subagent calls `compact_next`, which returns the job text, and answers with `compact_submit`. The reply to a submit holds the next job, so each job costs one request. A worker sees at most 8,000 characters of a tool call or result, and the log keeps the original.
-- Cost: the `optchat-compactor` subagent runs on Claude Haiku, and only when you type `/optchat-compact`. A run covers the messages that existed when it started. The Claude Code status line shows how many messages wait, once at least 30 wait. Nothing about the backlog goes into the context of an agent.
+- Cost: the `optchat-compactor` subagent runs on Claude Haiku, and only when you type `/optchat-compact`. A run covers the messages that existed when it started. The Claude Code status line shows how many messages wait, once at least 30 wait. Nothing about the backlog goes into the context of an agent. With an API key, the service does this work and the subagent is needed only when the API fails (see below).
 - Recording: Claude Code hooks record your prompts and the final replies of the agents word for word. The tool calls of one turn become one short record of what changed and what failed. Exploration is kept only as counts and a few file names, because its content stays on disk. Your answers to agent questions are kept in full. Subagent reports, also those of background subagents, and approved plans are kept up to 4,000 characters. Messages from other Claude sessions are kept up to 4,000 characters too. Claude Code also submits notices of the app and of background tasks as prompts. OptChat does not keep them. Codex hooks record your prompts and the final replies of the agents. They run in the background, so they never delay a turn.
+
+## Summaries on API credit
+
+```sh
+./run api-key
+```
+
+The command prints the link to the key page of the Claude Console, https://platform.claude.com/settings/keys, and opens it when the machine has a desktop. You paste the key, and the input stays hidden. One request of a few tokens checks the key, and the key goes to `~/.config/optchat/anthropic-api-key`, which only your user can read. `./run api-key --remove` deletes it.
+
+With a key, the memory service sends the compaction jobs to Claude Haiku 5.5 (`claude-haiku-5-5`, low effort). It starts once 10 summaries wait, or once fewer have waited for 10 minutes without new messages. Each worker is one conversation in the prompt cache, so a job costs a small fraction of a cent. `./run status` shows the lines written and the estimated dollars under `api`.
+
+When a request fails, the service pauses the API and gives the job back, and the job does not count as a failure of the messages:
+
+| Failure | Next automatic try |
+|---|---|
+| no credit (HTTP 402) | after 1 hour |
+| key rejected or access denied | after a new key |
+| rate limited | after the time that the API asks for, at least 1 minute |
+| API not reachable or overloaded | after 5 minutes |
+| any other error | after 1 hour |
+
+While the API is paused, the status line says why, for example `OptChat: 45 to summarize, API: no credit`. `/optchat-compact` first runs `./run compact`, which asks the service to try the API at once. When the API works, the service writes the summaries in the background. When it fails or no key is stored, the agent starts the compactor subagent as before.
+
+Only a machine with a key uses the API. When several machines have a key, two of them can summarize the same new messages at the same time. The summaries stay correct, and the second costs a little.
 
 ## Several machines without an owner
 
@@ -50,7 +74,7 @@ The first command prints every change. The second command makes the changes:
 - It writes `~/.config/optchat/config.json`.
 - It starts the service at login, with launchd on macOS or a systemd user unit on Linux.
 - It registers the `optchat` MCP server for Claude Code and Codex, with only the five tools that read the memory. Hooks record the chats, so agents never call a tool to record them.
-- It adds the recording hooks, the `optchat-compactor` subagent, the `/optchat-compact` command and a status line to Claude Code. An existing status line stays. The subagent starts its own server with the job tools, so other sessions never load them.
+- It adds the recording hooks, the `optchat-compactor` subagent, the `/optchat-compact` command and a status line to Claude Code. The command tries the API first when a key is stored. An existing status line stays. The subagent starts its own server with the job tools, so other sessions never load them.
 - It adds the recording hooks to `~/.codex/hooks.json`. Codex runs a new hook only after you trust it once with `/hooks`.
 - It appends a short OptChat section to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`.
 
@@ -74,6 +98,8 @@ The compactor subagent gets the job tools (`run mcp --jobs`): `compact_next`, `c
 
 ```sh
 ./run status
+./run api-key                       # store an API key; --remove deletes it
+./run compact                       # write summaries with the API now; exit status 3 if it fails
 ./run view
 ./run zoom 0 1
 ./run append note 'A decision to keep.'
@@ -93,6 +119,7 @@ The compactor subagent gets the job tools (`run mcp --jobs`): `compact_next`, `c
   pool/  outsum/        summaries from other machines and summaries written here
   delivery.sqlite3      event ids for hook delivery and crash recovery
   jobs.json  sync.json  job progress and replication state
+  api.json              lines and estimated dollars of the API worker
   spool/                hook events, written to disk before delivery
 ```
 

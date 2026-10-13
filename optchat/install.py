@@ -163,7 +163,7 @@ def install(args):
     if args.apply:
         chat.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    # Start the memory service automatically. It runs no models.
+    # Start the memory service automatically. It runs no model, unless the user stores an API key.
     env = {"PYTHONPATH": str(REPO), "OPTCHAT_CONFIG": str(CONFIG)}
     # A hook or MCP client may have started a copy outside launchd or systemd.
     # Stop whichever copy runs, so the restarted service loads the new code.
@@ -177,7 +177,7 @@ def install(args):
         launchd_reload(plan, plist)
     else:
         unit = HOME / ".config/systemd/user/optchat.service"
-        body = "\n".join(["[Unit]", "Description=OptChat memory service (it runs no models)", "After=network-online.target", "",
+        body = "\n".join(["[Unit]", "Description=OptChat memory service", "After=network-online.target", "",
                           "[Service]", *[f"Environment={k}={v}" for k, v in env.items()],
                           f"ExecStart={python()} -m optchat --chat {chat} serve --wait", "Restart=always", "RestartSec=10", "",
                           "[Install]", "WantedBy=default.target", ""])
@@ -212,7 +212,8 @@ def install(args):
         plan.write(settings_path, json.dumps(settings, indent=2) + "\n", "hooks that record every Claude session, and the status line")
         agent = (REPO / "integrations/optchat-compactor.md").read_text().replace("{RUN}", str(RUN))
         plan.write(claude_home / "agents/optchat-compactor.md", agent, "compaction subagent with its own job server")
-        plan.write(claude_home / "commands/optchat-compact.md", (REPO / "integrations/optchat-compact-command.md").read_text(), "the /optchat-compact command")
+        command = (REPO / "integrations/optchat-compact-command.md").read_text().replace("{RUN}", str(RUN))
+        plan.write(claude_home / "commands/optchat-compact.md", command, "the /optchat-compact command")
 
     # Hooks record every Codex session.
     codex_home = HOME / ".codex"

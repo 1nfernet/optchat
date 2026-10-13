@@ -10,7 +10,7 @@ from .service import Client, DEFAULT_CHAT, Service
 
 
 def parser():
-    p = argparse.ArgumentParser(description="OptChat: one memory for Claude Code and Codex agents, served over MCP. It never runs a model.")
+    p = argparse.ArgumentParser(description="OptChat: one memory for Claude Code and Codex agents, served over MCP. It runs no model, unless you store an API key with api-key.")
     p.add_argument("--chat", type=Path, default=DEFAULT_CHAT)
     sub = p.add_subparsers(dest="command", required=True)
     mcp = sub.add_parser("mcp", help="Serve MCP over stdio, and start the memory service if it is not running")
@@ -31,6 +31,10 @@ def parser():
     hook = sub.add_parser("hook", help="Record a Claude Code or Codex hook event (JSON on stdin)")
     hook.add_argument("--agent", choices=("claude", "codex"), default="claude", help="The program that runs the hook")
     sub.add_parser("status-line", help="One short line for the Claude Code status line; empty when little waits")
+    key = sub.add_parser("api-key", help="Store an Anthropic API key, so that the memory service writes summaries on your API credit")
+    key.add_argument("--remove", action="store_true", help="Delete the stored key")
+    key.add_argument("--no-browser", action="store_true", help="Only print the link to the key page")
+    sub.add_parser("compact", help="Let the memory service write summaries with the API now. Exit status 3: the API is not available, so use the subagent.")
     call = sub.add_parser("call", help="Call a memory method with JSON arguments")
     call.add_argument("method"); call.add_argument("arguments", nargs="?", default="{}")
     ins = sub.add_parser("install", help="Set up OptChat for every agent session on this machine. Without --apply it only prints the changes.")
@@ -57,6 +61,9 @@ def main():
             else:
                 install.uninstall(args)
             return
+        if args.command == "api-key":
+            from .api import key_command
+            raise SystemExit(key_command(remove=args.remove, browser=not args.no_browser))
         if args.command == "serve":
             from .config import load_config
             asyncio.run(Service(args.chat, config=load_config(args.chat), wait=args.wait).serve()); return
@@ -71,6 +78,10 @@ def main():
         if args.command == "mcp":
             from .mcp import JOB_TOOLS, MEMORY_TOOLS, TOOLS
             serve_stdio(client, MEMORY_TOOLS if args.memory_only else JOB_TOOLS if args.jobs else TOOLS); return
+        if args.command == "compact":
+            from .api import compact_command
+            from .install import RUN
+            raise SystemExit(compact_command(client, RUN))
         if args.command == "hook":
             event = json.load(sys.stdin)
             from .hooks import enqueue

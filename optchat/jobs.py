@@ -1,4 +1,4 @@
-"""Compaction jobs for agent workers. The server itself never runs a model."""
+"""Compaction jobs for workers: agent subagents, or the API worker of the service when the user stored a key."""
 from __future__ import annotations
 
 import heapq
@@ -148,13 +148,9 @@ class JobBoard:
         now = self.clock()
         for token, job in list(self.leases.items()):
             if job.expires <= now:
-                del self.leases[token]
-                self.workers[job.worker].closed = True
                 # An expired lease means a closed chat or a cancelled worker. It says
                 # nothing about the source. Only explicit failures pause a line.
-                for _, task in job.open():
-                    self.claimed.discard(task.part.key)
-                    self.enqueue(task.part)
+                self.abandon(token)
         while self.delayed and self.delayed[0][0] <= now:
             _, l, i = heapq.heappop(self.delayed)
             if not self.blocked(Part(l, i)):
@@ -516,6 +512,17 @@ class JobBoard:
             self.workers[job.worker].closed = True
         blocked = any(self.blocked(t.part) for _, t in targets)
         return {"status": "blocked" if blocked else "released", "open_tasks": [n for n, _ in job.open()], "retry_after_seconds": None if blocked else RETRY}
+
+    def abandon(self, token):
+        """Give the open tasks of a job back without a failure, for example when a worker lost its model."""
+        job = self.leases.pop(token, None)
+        if job is None:
+            return {"status": "unknown"}
+        self.workers[job.worker].closed = True
+        for _, task in job.open():
+            self.claimed.discard(task.part.key)
+            self.enqueue(task.part)
+        return {"status": "abandoned", "tasks": len(job.open())}
 
     def resume(self, id, n):
         if type(id) is not int or type(n) is not int or n < 1 or n & (n - 1) or id < 0 or id % n:

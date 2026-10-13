@@ -1,4 +1,4 @@
-"""The memory service: the only writer of a chat directory. It never starts a model and never reads model credentials."""
+"""The memory service: the only writer of a chat directory. It runs no model, unless the user stored an API key (see api.py)."""
 from __future__ import annotations
 
 import asyncio
@@ -15,6 +15,7 @@ import time
 import threading
 from pathlib import Path
 
+from . import api
 from .export import backup, export_html
 from .jobs import BATCH_TASKS, STATUS_AT, JobBoard
 from .ledger import Ledger
@@ -53,12 +54,16 @@ class Service:
             self.ledger = Ledger(self.store, self.replica)
             self.memory = Memory(self.store, budget)
             self.board = JobBoard(self.memory, pool=self.replica, batch_tasks=BATCH_TASKS)
+            self.api = api.ApiCompactor(self.store.path, clock=clock)
             self.replica.attach(self.board)
         except BaseException:
             self.store.close()
             raise
         self.interval = self.config.get("interval", 15)
         self.sync_task = None
+        self.api_task = None
+        # Only the configured memory of a machine uses the API, so tests and scratch memories never spend credit.
+        self.api_enabled = bool(self.config)
         self.path = endpoint(chat)
         self.token = secrets.token_urlsafe(32)
         atomic_json(self.store.path / "connection.json", {"token": self.token})
@@ -76,7 +81,7 @@ class Service:
                 "failures": {f"{i*2**l}+{2**l}": {"reason": reason, "blocked": b.blocked(Part(l, i))} for (l, i), reason in b.failures.items()},
                 "queued_hook_events": len(list((self.store.path / 'spool').glob('*.json'))),
                 "rejected_hook_events": len(list((self.store.path / 'spool' / 'failed').glob('*.json'))), "model_processes": 0,
-                "replication": self.replica.status()}
+                "replication": self.replica.status(), "api": self.api.state(api.load_key()) if self.api_enabled else {"status": "off"}}
 
     def call(self, method, args, client="local"):
         if not self.draining and method not in ("hook", "flush_hooks", "shutdown"):
@@ -102,7 +107,22 @@ class Service:
             return {"text": self.memory.search(args["query"], args.get("limit", 10))}
         if method == "status_line":
             waiting = len(self.board.backlog())
-            return {"text": f"OptChat: {waiting} to summarize" if waiting >= STATUS_AT else ""}
+            if waiting < STATUS_AT:
+                return {"text": ""}
+            note = self.api.note(api.load_key()) if self.api_enabled else ""
+            return {"text": f"OptChat: {waiting} to summarize" + (f", {note}" if note else "")}
+        if method == "api_status":
+            return self.api.state(api.load_key())
+        if method == "api_compact":
+            if not self.api_enabled:
+                return {"status": "off", "reason": "this memory has no machine config, so it does not use the API"}
+            key = api.load_key()
+            if key is None:
+                return self.api.state(None)
+            if not self.api.running:
+                self.api.forced = True
+                self.api.wake.set()
+            return {**self.api.state(key), "target": self.api.run if self.api.running else self.api.run + 1}
         if method == "zoom":
             return {"text": self.memory.zoom(args["id"], args["n"])}
         if method == "date":
@@ -122,6 +142,8 @@ class Service:
             return self.board.submit(args["job"], lines, chain=args.get("chain", True))
         if method == "compact_release":
             return self.board.release(args["job"], args["reason"], args.get("task"))
+        if method == "compact_abandon":
+            return self.board.abandon(args["job"])
         if method == "compact_resume":
             return self.board.resume(args["id"], args["n"])
         if method == "export":
@@ -241,12 +263,15 @@ class Service:
             loop.add_signal_handler(sig, self.stopping.set)
         if self.replica.exchange:
             self.sync_task = asyncio.create_task(self.replicate())
+        if self.api_enabled:
+            self.api_task = asyncio.create_task(self.summarize())
         try:
             await self.stopping.wait()
         finally:
-            if self.sync_task:
-                self.sync_task.cancel()
-                await asyncio.gather(self.sync_task, return_exceptions=True)
+            tasks = [t for t in (self.sync_task, self.api_task) if t]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             self.server.close()
             await self.server.wait_closed()
             self.path.unlink(missing_ok=True)
@@ -273,6 +298,33 @@ class Service:
                 await asyncio.wait_for(self.stopping.wait(), self.interval)
             except asyncio.TimeoutError:
                 pass
+
+    def model_work(self):
+        """Summaries that need a model: long messages and merges that are too long to be their own line."""
+        self.board.advance()
+        merges = sum(1 for key in self.board.nonfree if key[0] > 0 and key not in self.store.tree and not self.board.blocked(Part(*key)))
+        return len(self.board.backlog()) + merges
+
+    async def summarize(self):
+        """Send compaction jobs to the API when this machine has a key. Without a key, or while the API is paused, agents write the summaries."""
+        while not self.stopping.is_set():
+            try:
+                await asyncio.wait_for(self.api.wake.wait(), api.CHECK)
+            except asyncio.TimeoutError:
+                pass
+            forced, self.api.forced = self.api.forced, False
+            self.api.wake.clear()
+            key = api.load_key()
+            if not self.api.ready(key, forced) or not (forced or self.api.due(self.memory.total, self.model_work())):
+                continue
+            try:
+                await self.api.compact(self.call, key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A fault here must not stop the memory. The subagent can still write the summaries.
+                self.api.pause(api.ApiError("error", f"API worker: {exc}"), key)
+                print(f"API worker: {exc}", file=sys.stderr, flush=True)
 
     def close(self):
         self.ledger.close()

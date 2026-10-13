@@ -1,4 +1,4 @@
-"""MCP stdio frontend of the memory service. The service never runs a model."""
+"""MCP stdio frontend of the memory service."""
 import json
 import sys
 
